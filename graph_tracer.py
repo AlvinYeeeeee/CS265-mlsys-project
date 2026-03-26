@@ -3,6 +3,7 @@ from copy import copy
 from dataclasses import dataclass
 from functools import partial, wraps
 from typing import Any, Callable, Dict, List, Optional, Union
+import warnings
 from utils import SPMD_DECOMP_TABLE
 
 import torch
@@ -243,13 +244,15 @@ def _compile(func: Callable, *args: Any, **kwargs: Any):
     args = pytree.tree_map_only(torch.Tensor, _get_fake_args, args)
     kwargs = pytree.tree_map_only(torch.Tensor, _get_fake_args, kwargs)
 
-    with _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
-        gm = make_fx(
-            partial(stateless_func, func),
-            tracing_mode=tracing_mode,
-            decomposition_table=SPMD_DECOMP_TABLE,
-            _allow_non_fake_inputs=False,
-        )(params, buffers, named_states, args, kwargs)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Anomaly Detection has been enabled")
+        with _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
+            gm = make_fx(
+                partial(stateless_func, func),
+                tracing_mode=tracing_mode,
+                decomposition_table=SPMD_DECOMP_TABLE,
+                _allow_non_fake_inputs=False,
+            )(params, buffers, named_states, args, kwargs)
 
     params_and_buffers: Dict[str, Union[torch.Tensor, nn.Parameter]] = {
         **params,

@@ -1,6 +1,9 @@
-import importlib
+import argparse
 from typing import Any, Dict, List
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +12,7 @@ import torch.fx as fx
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     ModelArgs,
     Transformer,
-    )
+)
 from torchvision.models import resnet18, resnet50
 from graph_prof import GraphProfiler
 from graph_tracer import SEPFunction, compile
@@ -25,6 +28,13 @@ model_batch_sizes: Dict[str, int] = {
     "Transformer": 4,
     "Resnet18": 16,
     "Resnet50": 4,
+}
+
+# Batch sizes to sweep for the peak-memory bar graph (deliverable 4b).
+sweep_batch_sizes: Dict[str, List[int]] = {
+    "Transformer": [1, 2, 4, 8],
+    "Resnet18":    [4, 8, 16, 32, 64],
+    "Resnet50":    [1, 2, 4, 8, 16],
 }
 
 
@@ -62,7 +72,7 @@ class Experiment:
                 optim.zero_grad()
 
             self.train_step = transformer_train_step
-            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, foreach=True, capturable=True)
 
         elif self.model_name in ["Resnet18", "Resnet50"]:
             inp = torch.randn(self.batch_size, 3, 224, 224, device=dev)
@@ -81,7 +91,7 @@ class Experiment:
                 optim.step()
                 optim.zero_grad()
 
-            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, foreach=True, capturable=True)
             self.train_step = resnet_train_step
 
     def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):
@@ -97,20 +107,20 @@ class Experiment:
         self.optimizer.zero_grad()
 
     def graph_transformation(self, gm: fx.GraphModule, args: Any) -> fx.GraphModule:
-        print(gm.graph.print_tabular())
         warm_up_iters, profile_iters = 2, 3
-        graph_profiler = GraphProfiler(gm)
+        self.profiler = GraphProfiler(gm)
 
         with torch.no_grad():
             for _ in range(warm_up_iters):
-                graph_profiler.run(*args)
-            graph_profiler.reset_stats()
+                self.profiler.run(*args)
+            self.profiler.reset_stats()
 
             for _ in range(profile_iters):
-                graph_profiler.run(*args)
-            graph_profiler.aggregate_stats()
-            graph_profiler.print_stats()
+                self.profiler.run(*args)
+            self.profiler.aggregate_stats()
+            self.profiler.print_stats()
 
+        self.peak_mem_by_cat = self.profiler.peak_memory_by_category()
         return gm
 
     def run(self):
@@ -118,8 +128,91 @@ class Experiment:
         print("Successful.")
 
 
-if __name__ == "__main__":
-    exp = Experiment(model_names[1], model_batch_sizes[model_names[1]])
+def run_single(model_name: str, batch_size: int) -> None:
+    """Profile one model at one batch size and print stats."""
+    print(f"\n{'='*60}")
+    print(f"  Model: {model_name}   Batch size: {batch_size}")
+    print(f"{'='*60}")
+    exp = Experiment(model_name, batch_size)
     exp.init_opt_states()
     compiled_fn = compile(exp.train_step, exp.graph_transformation)
     compiled_fn(exp.model, exp.optimizer, exp.example_inputs)
+
+
+def run_memory_sweep(model_name: str, out_dir: str = "records") -> None:
+    """
+    Sweep batch sizes for one model, collect peak memory per category,
+    and save a stacked bar chart to records/.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    batch_sizes = sweep_batch_sizes[model_name]
+    categories  = ["params", "activations", "gradients", "opt_states", "other"]
+    colors      = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
+
+    results: Dict[str, List[float]] = {c: [] for c in categories}
+
+    for bs in batch_sizes:
+        print(f"\n[sweep] {model_name}  batch_size={bs}")
+        try:
+            exp = Experiment(model_name, bs)
+            exp.init_opt_states()
+            compiled_fn = compile(exp.train_step, exp.graph_transformation)
+            compiled_fn(exp.model, exp.optimizer, exp.example_inputs)
+            mem = exp.peak_mem_by_cat
+        except torch.cuda.OutOfMemoryError:
+            print(f"  OOM at batch_size={bs}, stopping sweep.")
+            batch_sizes = batch_sizes[: batch_sizes.index(bs)]
+            break
+
+        for cat in categories:
+            results[cat].append(mem.get(cat, 0) / 1e9)   # bytes -> GB
+
+    # --- plot ---
+    x      = range(len(batch_sizes))
+    width  = 0.6
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bottoms = [0.0] * len(batch_sizes)
+
+    for cat, color in zip(categories, colors):
+        vals = results[cat]
+        ax.bar(x, vals, width, bottom=bottoms, label=cat, color=color)
+        bottoms = [b + v for b, v in zip(bottoms, vals)]
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([str(b) for b in batch_sizes])
+    ax.set_xlabel("Batch size")
+    ax.set_ylabel("Peak GPU memory (GB)")
+    ax.set_title(f"{model_name} — Peak Memory vs Batch Size (no AC)")
+    ax.legend(loc="upper left")
+    plt.tight_layout()
+
+    path = os.path.join(out_dir, f"peak_memory_{model_name.lower()}.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"\nSaved bar chart → {path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model", choices=model_names, default="Resnet18",
+        help="Model to profile",
+    )
+    parser.add_argument(
+        "--mode", choices=["single", "sweep"], default="single",
+        help="'single' profiles at the default batch size; "
+             "'sweep' generates the peak-memory bar graph",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Override batch size for --mode single",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "single":
+        bs = args.batch_size or model_batch_sizes[args.model]
+        run_single(args.model, bs)
+    else:
+        run_memory_sweep(args.model)
