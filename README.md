@@ -10,6 +10,7 @@ This repo is the starter code for [Harvard CS265 ML Systems project](http://dasl
 3. Prepare the software environment
 ``` bash
 conda create -n cs265
+$env:PYTHONIOENCODING = "utf-8"
 conda activate cs265
 
 conda install conda-forge::python=3.12 conda-forge::numpy=2.2.2 pytorch::pytorch=2.5.1 pytorch::pytorch-cuda=12.4 -n cs265

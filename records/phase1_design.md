@@ -1,6 +1,6 @@
 # Phase 1 Design: Graph Profiler
 
-**CS265 MLSys Project — Spring 2025**
+**CS265 MLSys Project — Spring 2026**
 **Date:** 2026-03-22
 
 ---

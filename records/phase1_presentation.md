@@ -633,3 +633,167 @@ Given these, Phase 2 will compute a recomputation cost for each activation
 (sum of runtimes of the subgraph needed to reproduce it) and compare it
 against the memory saved by discarding it. The greedy algorithm from the
 μ-TWO paper then selects the subset of activations to checkpoint.
+
+---
+
+## Part 5: How to Interpret the Results
+
+### Reading the Per-Node Stats Table
+
+Each row in the printed table looks like this:
+
+```
+Node                    Op       NodeType   Runtime(ms)  MemDelta(MB)
+relu                    call_fun ACT              0.031         0.400
+addmm_1                 call_fun OTHER            0.041         0.000
+t_10                    call_fun ACT              0.002         0.040
+```
+
+**Node** — the name `fx` assigned to the operation in the graph.
+
+**NodeType** — what role this node plays:
+- `ACT`: this is an activation tensor that Phase 2 might checkpoint. Look at
+  its `MemDelta` — that is exactly how much GPU memory would be freed if it
+  were discarded.
+- `GRAD`: a backward computation. These have non-zero runtimes but allocate
+  memory only temporarily (their delta goes to zero by the end of backward).
+- `PARAM` / `OPT` / `INPUT`: placeholders. Their `MemDelta` is zero because
+  they are pre-allocated before the graph runs.
+- `OTHER`: overhead ops (copy_, getitem, sentinel). Usually tiny runtime and
+  zero memory delta.
+
+**Runtime(ms)** — average GPU kernel time over the 3 profile iterations.
+A node that takes `0.000 ms` is typically a metadata-only op (a `getitem`
+slicing into a list result, for example) — no kernel is actually launched.
+High-runtime nodes in the forward region are expensive to recompute; you want
+to avoid checkpointing those.
+
+**MemDelta(MB)** — how much GPU memory changed after this node executed.
+- Positive: the node allocated a new tensor (e.g. `relu` output).
+- Zero or negative: the node consumed an existing tensor and the allocator
+  reused memory, or the node is an in-place op.
+- The sum of all positive `MemDelta` values across `ACT` nodes equals the
+  **total activation memory** printed at the bottom of the table.
+
+**Summary lines at the bottom:**
+
+```
+Total forward  runtime : 3.551 ms
+Total backward runtime : 23.752 ms
+Total activation memory: 4.36 MB
+```
+
+- The ratio `backward / forward` is normally 2–5×. For the DummyModel it is
+  ~6.7×; for the real models it settles around 4.7–5×. A ratio much larger
+  than 5 would suggest an unusually expensive backward op worth investigating.
+- `Total activation memory` is the peak amount that must be kept alive
+  simultaneously for the backward pass. This is the budget Phase 2 is trying
+  to reduce.
+
+---
+
+### Reading the Activation Lifetime Table
+
+```
+Activation              Size(MB)    last_fwd_use         first_bwd_use
+relu                       0.400         addmm_1               mm_17
+relu_1                     0.400         addmm_2               mm_15
+relu_8                     0.400        addmm_9    threshold_backward_1
+relu_9                     0.400       addmm_10      threshold_backward
+```
+
+**Size(MB)** — the raw byte cost of keeping this activation alive. Larger
+means more memory saved if checkpointed.
+
+**last_fwd_use** — the last operation in the forward pass that reads this
+activation. After this node finishes, the activation sits idle until backward
+starts. If `last_fwd_use` is the node that produced it (no other forward op
+reads it), the idle window starts immediately.
+
+**first_bwd_use** — the first backward operation that needs this activation.
+The further this is from the top of the backward region, the longer the
+activation has been idle.
+
+**The idle window = graph index of `first_bwd_use` minus graph index of
+`last_fwd_use`.** A large idle window means:
+1. A long time passes between the activation being created and it being needed
+   in backward.
+2. If we checkpoint it, we have a large window in which the memory can be
+   reclaimed.
+
+In the DummyModel results above, `relu` (layer 1) has `last_fwd_use = addmm_1`
+(very early in the graph) and `first_bwd_use = mm_17` (near the very end of
+backward). This is the longest possible idle window — `relu` is the best
+candidate to checkpoint. By contrast, `relu_9` (last layer) is needed almost
+immediately in backward (`threshold_backward`), so checkpointing it would
+save memory for almost no time.
+
+The pattern reverses as you go deeper: **earlier layers = longer idle window =
+better checkpoint candidates.**
+
+---
+
+### Reading the Peak Memory Bar Charts
+
+Each bar chart (`peak_memory_<model>.png`) shows stacked bars for each
+batch size tested:
+
+```
+Peak GPU memory (GB)
+  │   ┌────────┐
+  │   │ other  │
+  │   ├────────┤
+  │   │opt_stat│
+  │   ├────────┤
+  │   │ grads  │
+  │   ├────────┤
+  │   │  acts  │  ← dominant, grows with batch size
+  │   ├────────┤
+  │   │ params │  ← flat, batch-size independent
+  └───┴────────┴── batch size
+```
+
+**What the colors mean:**
+
+| Color  | Category    | What it represents |
+|--------|-------------|-------------------|
+| Blue   | `params`    | Model weight tensors — fixed size regardless of batch |
+| Orange | `activations` | Forward-pass intermediate tensors — grows linearly with batch size |
+| Green  | `gradients` | Backward-pass tensors — also grows with batch size |
+| Red    | `opt_states`| Adam's exp_avg and exp_avg_sq — fixed size regardless of batch |
+| Purple | `other`     | Everything else (loss, sentinel ops) — near zero |
+
+**What to look for:**
+
+1. **Activations dominate and grow linearly.** In all three models, the orange
+   segment is the tallest and the only one that scales with batch size. This is
+   the fundamental motivation for activation checkpointing.
+
+2. **Params and optimizer states are flat.** Their memory is determined by the
+   number of model parameters, not the batch size. Doubling the batch size does
+   not change them at all. There is nothing to optimize there.
+
+3. **The OOM point.** For ResNet50, the sweep stops before the largest batch
+   size because the GPU runs out of memory. The last successful batch size
+   shows how close you are to the hardware limit without any checkpointing.
+   After Phase 2, the same batch sizes should fit because activation memory
+   will be reduced.
+
+4. **Comparing models.** ResNet18 vs ResNet50: ResNet50 has more layers and
+   wider feature maps, so its activation memory grows faster per batch sample.
+   The Transformer has a much smaller activation footprint because its
+   intermediate tensors are embedding-sized, not image-sized.
+
+---
+
+### Quick Sanity Checks
+
+These checks confirm the profiler is working correctly:
+
+| Observation | What it confirms |
+|-------------|-----------------|
+| `MemDelta > 0` only on forward nodes | Backward reuses buffers; activations are freed as backward consumes them |
+| `backward runtime ≈ 4–5× forward runtime` | Each backward layer computes two partial derivatives; rule of thumb is 2–3× compute but memory accesses add overhead |
+| `PARAM` and `OPT` nodes all have `Runtime ≈ 0` | Placeholders do not execute any kernel; they are just pointers to pre-allocated tensors |
+| Activation count matches layer count × 2 | Each `relu` output plus each transposed weight `t_*` feeds into the corresponding backward `mm` |
+| Peak activation memory ÷ batch size is constant | Confirms linear scaling; a non-linear result would indicate a bug in the memory timeline simulation |

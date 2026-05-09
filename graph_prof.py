@@ -34,7 +34,6 @@ class NodeType(Enum):
     INPUT = 4
     OTHER = 5
 
-
 class GraphProfiler(fx.Interpreter):
     """
     Profiles the combined fwd+bwd+optimizer fx.GraphModule produced by
@@ -65,14 +64,12 @@ class GraphProfiler(fx.Interpreter):
     def __init__(self, module: fx.GraphModule, garbage_collect_values: bool = True):
         super().__init__(module, garbage_collect_values)
 
-        # ------------------------------------------------------------------ #
-        # Static analysis                                                     #
-        # ------------------------------------------------------------------ #
+        # Static analysis
 
         nodes: List[fx.Node] = list(module.graph.nodes)
         node_to_idx: Dict[fx.Node, int] = {n: i for i, n in enumerate(nodes)}
 
-        # --- 1. Find the fwd/bwd sentinel boundaries ---
+        # 1. Find the fwd/bwd sentinel boundaries
         self.sep_node: Optional[fx.Node] = None
         self.sep_bwd_node: Optional[fx.Node] = None
         sep_idx = -1
@@ -89,7 +86,7 @@ class GraphProfiler(fx.Interpreter):
         assert self.sep_node is not None, "sep sentinel node not found in graph"
         assert self.sep_bwd_node is not None, "sep_backward sentinel node not found in graph"
 
-        # --- 2. Partition nodes into regions ---
+        # 2. Partition nodes into regions
         self.forward_nodes: Set[fx.Node] = {
             n for n in nodes if node_to_idx[n] < sep_idx
         }
@@ -97,16 +94,12 @@ class GraphProfiler(fx.Interpreter):
             n for n in nodes if node_to_idx[n] > sep_bwd_idx
         }
 
-        # --- 3. Identify model params and optimizer-state placeholders ---
-        # The _foreach_addcdiv (or _fused_adam) node performs the final weight
-        # update: W = W - lr * m_hat / (v_hat + eps).  Its first N placeholder
-        # args are the model parameters; remaining placeholder args are
-        # optimizer states.  We find this node heuristically by target name.
+        # 3. Identify model params and optimizer-state placeholders 
         param_nodes: Set[fx.Node] = set()
         opt_state_nodes: Set[fx.Node] = set()
         self._find_param_and_opt_nodes(nodes, param_nodes, opt_state_nodes)
 
-        # --- 4. Classify every node ---
+        # 4. Classify every node
         self.node_type: Dict[fx.Node, NodeType] = {}
         for node in nodes:
             self.node_type[node] = self._classify_node(
@@ -114,13 +107,13 @@ class GraphProfiler(fx.Interpreter):
                 param_nodes, opt_state_nodes,
             )
 
-        # --- 5. Find activations (fwd-created, bwd-consumed) ---
+        # 5. Find activations (fwd-created, bwd-consumed)
         self.activation_nodes: Set[fx.Node] = {
             n for n in nodes
             if self.node_type[n] == NodeType.ACT
         }
 
-        # --- 6. Record activation lifetime boundaries ---
+        # 6. Record activation lifetime boundaries
         self.act_last_fwd_use:  Dict[fx.Node, Optional[fx.Node]] = {}
         self.act_first_bwd_use: Dict[fx.Node, Optional[fx.Node]] = {}
 
@@ -137,9 +130,7 @@ class GraphProfiler(fx.Interpreter):
                 if bwd_users else None
             )
 
-        # ------------------------------------------------------------------ #
-        # Runtime stat storage                                                #
-        # ------------------------------------------------------------------ #
+        # Runtime stat storage
         # Filled during run_node; reset_stats clears these.
         self._runtimes:  Dict[fx.Node, List[float]] = defaultdict(list)  # ms
         self._mem_delta: Dict[fx.Node, List[int]]   = defaultdict(list)  # bytes
@@ -150,9 +141,7 @@ class GraphProfiler(fx.Interpreter):
         self.node_avg_runtime:   Dict[fx.Node, float] = {}
         self.node_avg_mem_delta: Dict[fx.Node, float] = {}
 
-    # ---------------------------------------------------------------------- #
     # Static analysis helpers                                                 #
-    # ---------------------------------------------------------------------- #
 
     def _find_param_and_opt_nodes(
         self,
@@ -253,7 +242,7 @@ class GraphProfiler(fx.Interpreter):
             return NodeType.OTHER
 
         if idx < sep_idx:
-            # Forward region — non-placeholder nodes are activations if any
+            # Forward region: non-placeholder nodes are activations if any
             # of their users are in the backward region.
             if any(node_to_idx.get(u, -1) > sep_bwd_idx for u in node.users):
                 return NodeType.ACT
@@ -265,9 +254,7 @@ class GraphProfiler(fx.Interpreter):
         # Between sep and sep_bwd (loss region)
         return NodeType.OTHER
 
-    # ---------------------------------------------------------------------- #
-    # Interpreter overrides                                                   #
-    # ---------------------------------------------------------------------- #
+    # Interpreter overrides
 
     def run(
         self,
@@ -319,9 +306,7 @@ class GraphProfiler(fx.Interpreter):
             )
         return 0
 
-    # ---------------------------------------------------------------------- #
-    # Stats lifecycle                                                         #
-    # ---------------------------------------------------------------------- #
+    # Stats lifecycle
 
     def reset_stats(self) -> None:
         """Clear accumulated runtime/memory lists (call after warm-up)."""
@@ -378,7 +363,7 @@ class GraphProfiler(fx.Interpreter):
         print(f"  Total backward runtime : {total_bwd_ms:.3f} ms")
         print(f"  Total activation memory: {total_act_mem / 1e6:.2f} MB\n")
 
-        # --- Activation lifetime summary ---
+        # Activation lifetime summary
         if not self.activation_nodes:
             print("No activation nodes found.")
             return
